@@ -1,5 +1,5 @@
 <!--
-Copyright 2002-2004 The Apache Software Foundation
+Copyright 2002-2022 The Apache Software Foundation
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -101,12 +101,12 @@ ZooKeeper:
     bin/zkServer.sh start
 
 
-ZooKeeper logs messages using log4j -- more detail
+ZooKeeper logs messages using _logback_ -- more detail
 available in the
 [Logging](zookeeperProgrammers.html#Logging)
 section of the Programmer's Guide. You will see log messages
 coming to the console (default) and/or a log file depending on
-the log4j configuration.
+the logback configuration.
 
 The steps outlined here run ZooKeeper in standalone mode. There is
 no replication, so if ZooKeeper process fails, the service will go down.
@@ -137,8 +137,7 @@ Once you have connected, you should see something like:
 
 
     Connecting to localhost:2181
-    log4j:WARN No appenders could be found for logger (org.apache.zookeeper.ZooKeeper).
-    log4j:WARN Please initialize the log4j system properly.
+    ...
     Welcome to ZooKeeper!
     JLine support is enabled
     [zkshell: 0]
@@ -163,13 +162,11 @@ From the shell, type `help` to get a listing of commands that can be executed fr
 	history
 	listquota path
 	ls [-s] [-w] [-R] path
-	ls2 path [watch]
 	printwatches on|off
 	quit
 	reconfig [-s] [-v version] [[-file path] | [-members serverID=host:port1:port2;port3[,...]*]] | [-add serverId=host:port1:port2;port3[,...]]* [-remove serverId[,...]*]
 	redo cmdno
 	removewatches path [-c|-d|-a] [-l]
-	rmr path
 	set [-s] [-v version] path data
 	setAcl [-s] [-v version] [-R] path acl
 	setquota -n|-b val path

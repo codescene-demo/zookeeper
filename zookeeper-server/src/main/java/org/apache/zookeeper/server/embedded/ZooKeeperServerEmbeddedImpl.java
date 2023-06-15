@@ -1,10 +1,15 @@
 package org.apache.zookeeper.server.embedded;
 
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import javax.security.sasl.SaslException;
 import org.apache.zookeeper.server.DatadirCleanupManager;
 import org.apache.zookeeper.server.ExitCode;
 import org.apache.zookeeper.server.ServerConfig;
@@ -41,6 +46,9 @@ class ZooKeeperServerEmbeddedImpl implements ZooKeeperServerEmbedded {
     private final ExitHandler exitHandler;
     private volatile boolean stopping;
 
+    private int boundClientPort;
+    private int boundSecureClientPort;
+
     ZooKeeperServerEmbeddedImpl(Properties p, Path baseDir, ExitHandler exitHandler) throws Exception {
         if (!p.containsKey("dataDir")) {
             p.put("dataDir", baseDir.resolve("data").toAbsolutePath().toString());
@@ -72,6 +80,11 @@ class ZooKeeperServerEmbeddedImpl implements ZooKeeperServerEmbedded {
 
     @Override
     public void start() throws Exception {
+        start(Integer.MAX_VALUE);
+    }
+
+    @Override
+    public void start(long startupTimeout) throws Exception {
         switch (exitHandler) {
             case EXIT:
                 ServiceUtils.setSystemExitProcedure(ServiceUtils.SYSTEM_EXIT);
@@ -83,12 +96,25 @@ class ZooKeeperServerEmbeddedImpl implements ZooKeeperServerEmbedded {
                 ServiceUtils.setSystemExitProcedure(ServiceUtils.SYSTEM_EXIT);
                 break;
         }
-
+        final CompletableFuture<String> started = new CompletableFuture<>();
 
         if (config.getServers().size() > 1 || config.isDistributed()) {
             LOG.info("Running ZK Server in single Quorum MODE");
 
-            maincluster = new QuorumPeerMain();
+            maincluster = new QuorumPeerMain() {
+                protected QuorumPeer getQuorumPeer() throws SaslException {
+                    return new QuorumPeer() {
+                        @Override
+                        public void start() {
+                            super.start();
+                            boundClientPort = getClientPort();
+                            boundSecureClientPort = getSecureClientPort();
+                            LOG.info("ZK Server {} started", this);
+                            started.complete(null);
+                        }
+                    };
+                }
+            };
 
             // Start and schedule the the purge task
             purgeMgr = new DatadirCleanupManager(config
@@ -118,7 +144,15 @@ class ZooKeeperServerEmbeddedImpl implements ZooKeeperServerEmbedded {
             thread.start();
         } else {
             LOG.info("Running ZK Server in single STANDALONE MODE");
-            mainsingle = new ZooKeeperServerMain();
+            mainsingle = new ZooKeeperServerMain() {
+                @Override
+                public void serverStarted() {
+                    LOG.info("ZK Server started");
+                    boundClientPort = getClientPort();
+                    boundSecureClientPort = getSecureClientPort();
+                    started.complete(null);
+                }
+            };
             purgeMgr = new DatadirCleanupManager(config
                     .getDataDir(), config.getDataLogDir(), config
                     .getSnapRetainCount(), config.getPurgeInterval());
@@ -146,6 +180,34 @@ class ZooKeeperServerEmbeddedImpl implements ZooKeeperServerEmbedded {
             };
             thread.start();
         }
+
+        try {
+            started.get(startupTimeout, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException err) {
+            LOG.info("Startup timed out, trying to close");
+            close();
+            throw err;
+        }
+    }
+
+    @Override
+    public String getConnectionString() {
+        return prettifyConnectionString(config.getClientPortAddress(), boundClientPort);
+    }
+
+    @Override
+    public String getSecureConnectionString() {
+        return prettifyConnectionString(config.getSecureClientPortAddress(), boundSecureClientPort);
+    }
+
+    private String prettifyConnectionString(InetSocketAddress confAddress, int boundPort) {
+        if (confAddress != null) {
+            return confAddress.getHostString()
+                .replace("0.0.0.0", "localhost")
+                .replace("0:0:0:0:0:0:0:0", "localhost")
+                + ":" + boundPort;
+        }
+        throw new IllegalStateException("No client address is configured");
     }
 
     @Override

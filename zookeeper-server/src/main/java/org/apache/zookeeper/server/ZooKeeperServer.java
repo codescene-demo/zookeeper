@@ -19,6 +19,7 @@
 package org.apache.zookeeper.server;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
@@ -35,12 +36,16 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
+import java.util.zip.Adler32;
+import java.util.zip.CheckedInputStream;
 import javax.security.sasl.SaslException;
 import org.apache.jute.BinaryInputArchive;
 import org.apache.jute.BinaryOutputArchive;
+import org.apache.jute.InputArchive;
 import org.apache.jute.Record;
 import org.apache.zookeeper.Environment;
 import org.apache.zookeeper.KeeperException;
@@ -52,6 +57,7 @@ import org.apache.zookeeper.Version;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.ZookeeperBanner;
+import org.apache.zookeeper.common.PathUtils;
 import org.apache.zookeeper.common.StringUtils;
 import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.data.ACL;
@@ -82,6 +88,7 @@ import org.apache.zookeeper.server.quorum.QuorumPeerConfig;
 import org.apache.zookeeper.server.quorum.ReadOnlyZooKeeperServer;
 import org.apache.zookeeper.server.util.JvmPauseMonitor;
 import org.apache.zookeeper.server.util.OSMXBean;
+import org.apache.zookeeper.server.util.QuotaMetricsUtils;
 import org.apache.zookeeper.server.util.RequestPathMetricsCollector;
 import org.apache.zookeeper.txn.CreateSessionTxn;
 import org.apache.zookeeper.txn.TxnDigest;
@@ -108,7 +115,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
 
     // When enabled, will check ACL constraints appertained to the requests first,
     // before sending the requests to the quorum.
-    static final boolean enableEagerACLCheck;
+    static boolean enableEagerACLCheck;
 
     static final boolean skipACL;
 
@@ -120,10 +127,14 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     public static final String ZOOKEEPER_DIGEST_ENABLED = "zookeeper.digest.enabled";
     private static boolean digestEnabled;
 
+    public static final String ZOOKEEPER_SERIALIZE_LAST_PROCESSED_ZXID_ENABLED = "zookeeper.serializeLastProcessedZxid.enabled";
+    private static boolean serializeLastProcessedZxidEnabled;
+
     // Add a enable/disable option for now, we should remove this one when
     // this feature is confirmed to be stable
     public static final String CLOSE_SESSION_TXN_ENABLED = "zookeeper.closeSessionTxn.enabled";
     private static boolean closeSessionTxnEnabled = true;
+    private volatile CountDownLatch restoreLatch;
 
     static {
         LOG = LoggerFactory.getLogger(ZooKeeperServer.class);
@@ -153,6 +164,20 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         closeSessionTxnEnabled = Boolean.parseBoolean(
                 System.getProperty(CLOSE_SESSION_TXN_ENABLED, "true"));
         LOG.info("{} = {}", CLOSE_SESSION_TXN_ENABLED, closeSessionTxnEnabled);
+
+        setSerializeLastProcessedZxidEnabled(Boolean.parseBoolean(
+                System.getProperty(ZOOKEEPER_SERIALIZE_LAST_PROCESSED_ZXID_ENABLED, "true")));
+    }
+
+    // @VisibleForTesting
+    public static boolean isEnableEagerACLCheck() {
+        return enableEagerACLCheck;
+    }
+
+    // @VisibleForTesting
+    public static void setEnableEagerACLCheck(boolean enabled) {
+        ZooKeeperServer.enableEagerACLCheck = enabled;
+        LOG.info("Update {} to {}", ENABLE_EAGER_ACL_CHECK, enabled);
     }
 
     public static boolean isCloseSessionTxnEnabled() {
@@ -194,6 +219,8 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     protected String initialConfig;
     protected boolean reconfigEnabled;
     private final RequestPathMetricsCollector requestPathMetricsCollector;
+    private static final int DEFAULT_SNAP_COUNT = 100000;
+    private static final int DEFAULT_GLOBAL_OUTSTANDING_LIMIT = 1000;
 
     private boolean localSessionEnabled = false;
     protected enum State {
@@ -214,7 +241,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     private final AtomicInteger requestsInProcess = new AtomicInteger(0);
     final Deque<ChangeRecord> outstandingChanges = new ArrayDeque<>();
     // this data structure must be accessed under the outstandingChanges lock
-    final Map<String, ChangeRecord> outstandingChangesForPath = new HashMap<String, ChangeRecord>();
+    final Map<String, ChangeRecord> outstandingChangesForPath = new HashMap<>();
 
     protected ServerCnxnFactory serverCnxnFactory;
     protected ServerCnxnFactory secureServerCnxnFactory;
@@ -251,7 +278,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         intBufferStartingSizeBytes = Integer.getInteger(INT_BUFFER_STARTING_SIZE_BYTES, DEFAULT_STARTING_BUFFER_SIZE);
 
         if (intBufferStartingSizeBytes < 32) {
-            String msg = "Buffer starting size must be greater than or equal to 32."
+            String msg = "Buffer starting size (" + intBufferStartingSizeBytes + ") must be greater than or equal to 32. "
                          + "Configure with \"-Dzookeeper.intBufferStartingSizeBytes=<size>\" ";
             LOG.error(msg);
             throw new IllegalArgumentException(msg);
@@ -261,7 +288,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     // Connection throttling
-    private BlueThrottle connThrottle = new BlueThrottle();
+    private final BlueThrottle connThrottle = new BlueThrottle();
 
     @SuppressFBWarnings(value = "IS2_INCONSISTENT_SYNC", justification =
         "Internally the throttler has a BlockingQueue so "
@@ -275,17 +302,17 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
      * too many large requests such that the JVM runs out of usable heap and
      * ultimately crashes.
      *
-     * The limit is enforced by the {@link checkRequestSize(int, boolean)}
+     * The limit is enforced by the {@link #checkRequestSizeWhenReceivingMessage(int)}
      * method which is called by the connection layer ({@link NIOServerCnxn},
      * {@link NettyServerCnxn}) before allocating a byte buffer and pulling
      * data off the TCP socket. The limit is then checked again by the
-     * ZooKeeper server in {@link processPacket(ServerCnxn, ByteBuffer)} which
-     * also atomically updates {@link currentLargeRequestBytes}. The request is
+     * ZooKeeper server in {@link #processPacket(ServerCnxn, RequestHeader, RequestRecord)} which
+     * also atomically updates {@link #currentLargeRequestBytes}. The request is
      * then marked as a large request, with the request size stored in the Request
-     * object so that it can later be decremented from {@link currentLargeRequestsBytes}.
+     * object so that it can later be decremented from {@link #currentLargeRequestBytes}.
      *
      * When a request is completed or dropped, the relevant code path calls the
-     * {@link requestFinished(Request)} method which performs the decrement if
+     * {@link #requestFinished(Request)} method which performs the decrement if
      * needed.
      */
     private volatile int largeRequestMaxBytes = 100 * 1024 * 1024;
@@ -298,7 +325,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
 
     private final AtomicInteger currentLargeRequestBytes = new AtomicInteger(0);
 
-    private AuthenticationHelper authHelper;
+    private final AuthenticationHelper authHelper = new AuthenticationHelper();
 
     void removeCnxn(ServerCnxn cnxn) {
         zkDb.removeCnxn(cnxn);
@@ -314,7 +341,6 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         listener = new ZooKeeperServerListenerImpl(this);
         serverStats = new ServerStats(this);
         this.requestPathMetricsCollector = new RequestPathMetricsCollector();
-        this.authHelper = new AuthenticationHelper();
     }
 
     /**
@@ -355,8 +381,6 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         this.requestPathMetricsCollector = new RequestPathMetricsCollector();
 
         this.initLargeRequestThrottlingSettings();
-
-        this.authHelper = new AuthenticationHelper();
 
         LOG.info(
             "Created server with"
@@ -525,23 +549,101 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         takeSnapshot();
     }
 
-    public void takeSnapshot() {
-        takeSnapshot(false);
+    public File takeSnapshot() throws IOException {
+        return takeSnapshot(false);
     }
 
-    public void takeSnapshot(boolean syncSnap) {
+    public File takeSnapshot(boolean syncSnap) throws IOException {
+        return takeSnapshot(syncSnap, true, false);
+    }
+
+    /**
+     * Takes a snapshot on the server.
+     *
+     * @param syncSnap syncSnap sync the snapshot immediately after write
+     * @param isSevere if true system exist, otherwise throw IOException
+     * @param fastForwardFromEdits whether fast forward database to the latest recorded transactions
+     *
+     * @return file snapshot file object
+     * @throws IOException
+     */
+    public synchronized File takeSnapshot(boolean syncSnap, boolean isSevere, boolean fastForwardFromEdits) throws IOException {
         long start = Time.currentElapsedTime();
+        File snapFile = null;
         try {
-            txnLogFactory.save(zkDb.getDataTree(), zkDb.getSessionWithTimeOuts(), syncSnap);
+            if (fastForwardFromEdits) {
+                zkDb.fastForwardDataBase();
+            }
+            snapFile = txnLogFactory.save(zkDb.getDataTree(), zkDb.getSessionWithTimeOuts(), syncSnap);
         } catch (IOException e) {
-            LOG.error("Severe unrecoverable error, exiting", e);
-            // This is a severe error that we cannot recover from,
-            // so we need to exit
-            ServiceUtils.requestSystemExit(ExitCode.TXNLOG_ERROR_TAKING_SNAPSHOT.getValue());
+            if (isSevere) {
+                LOG.error("Severe unrecoverable error, exiting", e);
+                // This is a severe error that we cannot recover from,
+                // so we need to exit
+                ServiceUtils.requestSystemExit(ExitCode.TXNLOG_ERROR_TAKING_SNAPSHOT.getValue());
+            } else {
+                throw e;
+            }
         }
         long elapsed = Time.currentElapsedTime() - start;
         LOG.info("Snapshot taken in {} ms", elapsed);
         ServerMetrics.getMetrics().SNAPSHOT_TIME.add(elapsed);
+        return snapFile;
+    }
+
+    /**
+     * Restores database from a snapshot. It is used by the restore admin server command.
+     *
+     * @param inputStream input stream of snapshot
+     * @Return last processed zxid
+     * @throws IOException
+     */
+    public synchronized long restoreFromSnapshot(final InputStream inputStream) throws IOException {
+        if (inputStream == null) {
+            throw new IllegalArgumentException("InputStream can not be null when restoring from snapshot");
+        }
+
+        long start = Time.currentElapsedTime();
+        LOG.info("Before restore database. lastProcessedZxid={}, nodeCount={}，sessionCount={}",
+            getZKDatabase().getDataTreeLastProcessedZxid(),
+            getZKDatabase().dataTree.getNodeCount(),
+            getZKDatabase().getSessionCount());
+
+        // restore to a new zkDatabase
+        final ZKDatabase newZKDatabase = new ZKDatabase(this.txnLogFactory);
+        final CheckedInputStream cis = new CheckedInputStream(new BufferedInputStream(inputStream), new Adler32());
+        final InputArchive ia = BinaryInputArchive.getArchive(cis);
+        newZKDatabase.deserializeSnapshot(ia, cis);
+        LOG.info("Restored to a new database. lastProcessedZxid={}, nodeCount={}, sessionCount={}",
+            newZKDatabase.getDataTreeLastProcessedZxid(),
+            newZKDatabase.dataTree.getNodeCount(),
+            newZKDatabase.getSessionCount());
+
+        // create a CountDownLatch
+        restoreLatch = new CountDownLatch(1);
+
+        try {
+            // set to the new zkDatabase
+            setZKDatabase(newZKDatabase);
+
+            // re-create SessionTrack
+            createSessionTracker();
+        } finally {
+            // unblock request submission
+            restoreLatch.countDown();
+            restoreLatch = null;
+        }
+
+        LOG.info("After restore database. lastProcessedZxid={}, nodeCount={}, sessionCount={}",
+                getZKDatabase().getDataTreeLastProcessedZxid(),
+                getZKDatabase().dataTree.getNodeCount(),
+                getZKDatabase().getSessionCount());
+
+        long elapsed = Time.currentElapsedTime() - start;
+        LOG.info("Restore taken in {} ms", elapsed);
+        ServerMetrics.getMetrics().RESTORE_TIME.add(elapsed);
+
+        return getLastProcessedZxid();
     }
 
     public boolean shouldForceWriteInitialSnapshotAfterLeaderElection() {
@@ -629,6 +731,12 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             "Expiring session 0x{}, timeout of {}ms exceeded",
             Long.toHexString(sessionId),
             session.getTimeout());
+        close(sessionId);
+    }
+
+    public void expire(long sessionId) {
+        LOG.info("forcibly expiring session 0x{}", Long.toHexString(sessionId));
+
         close(sessionId);
     }
 
@@ -728,9 +836,12 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     protected void startRequestThrottler() {
-        requestThrottler = new RequestThrottler(this);
+        requestThrottler = createRequestThrottler();
         requestThrottler.start();
+    }
 
+    protected RequestThrottler createRequestThrottler() {
+        return new RequestThrottler(this);
     }
 
     protected void setupRequestProcessors() {
@@ -777,6 +888,9 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
      * disk.</li>
      * <li>During shutdown the server sets the state to SHUTDOWN, which
      * corresponds to the server not running.</li></ul>
+     *
+     * <li>During maintenance (e.g. restore) the server sets the state to MAINTENANCE
+     * </li></ul>
      *
      * @param state new server state.
      */
@@ -991,10 +1105,9 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         long sessionId = sessionTracker.createSession(timeout);
         Random r = new Random(sessionId ^ superSecret);
         r.nextBytes(passwd);
-        ByteBuffer to = ByteBuffer.allocate(4);
-        to.putInt(timeout);
+        CreateSessionTxn txn = new CreateSessionTxn(timeout);
         cnxn.setSessionId(sessionId);
-        Request si = new Request(cnxn, sessionId, 0, OpCode.createSession, to, null);
+        Request si = new Request(cnxn, sessionId, 0, OpCode.createSession, RequestRecord.fromRecord(txn), null);
         submitRequest(si);
         return sessionId;
     }
@@ -1052,14 +1165,12 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
                 valid ? cnxn.getSessionTimeout() : 0,
                 valid ? cnxn.getSessionId() : 0, // send 0 if session is no
                 // longer valid
-                valid ? generatePasswd(cnxn.getSessionId()) : new byte[16]);
+                valid ? generatePasswd(cnxn.getSessionId()) : new byte[16],
+                this instanceof ReadOnlyZooKeeperServer);
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             BinaryOutputArchive bos = BinaryOutputArchive.getArchive(baos);
             bos.writeInt(-1, "len");
             rsp.serialize(bos, "connect");
-            if (!cnxn.isOldClient) {
-                bos.writeBool(this instanceof ReadOnlyZooKeeperServer, "readOnly");
-            }
             baos.close();
             ByteBuffer bb = ByteBuffer.wrap(baos.toByteArray());
             bb.putInt(bb.remaining() - 4).rewind();
@@ -1106,6 +1217,14 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     public void submitRequest(Request si) {
+        if (restoreLatch != null) {
+            try {
+                LOG.info("Blocking request submission while restore is in progress");
+                restoreLatch.await();
+            } catch (final InterruptedException e) {
+                LOG.warn("Unexpected interruption", e);
+            }
+        }
         enqueueRequest(si);
     }
 
@@ -1177,30 +1296,17 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     public static int getSnapCount() {
-        String sc = System.getProperty(SNAP_COUNT);
-        try {
-            int snapCount = Integer.parseInt(sc);
-
-            // snapCount must be 2 or more. See org.apache.zookeeper.server.SyncRequestProcessor
-            if (snapCount < 2) {
-                LOG.warn("SnapCount should be 2 or more. Now, snapCount is reset to 2");
-                snapCount = 2;
-            }
-            return snapCount;
-        } catch (Exception e) {
-            return 100000;
+        int snapCount = Integer.getInteger(SNAP_COUNT, DEFAULT_SNAP_COUNT);
+        // snapCount must be 2 or more. See org.apache.zookeeper.server.SyncRequestProcessor
+        if (snapCount < 2) {
+            LOG.warn("SnapCount should be 2 or more. Now, snapCount is reset to 2");
+            snapCount = 2;
         }
+        return snapCount;
     }
 
     public int getGlobalOutstandingLimit() {
-        String sc = System.getProperty(GLOBAL_OUTSTANDING_LIMIT);
-        int limit;
-        try {
-            limit = Integer.parseInt(sc);
-        } catch (Exception e) {
-            limit = 1000;
-        }
-        return limit;
+        return Integer.getInteger(GLOBAL_OUTSTANDING_LIMIT, DEFAULT_GLOBAL_OUTSTANDING_LIMIT);
     }
 
     public static long getSnapSizeInBytes() {
@@ -1369,18 +1475,13 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     @SuppressFBWarnings(value = "IS2_INCONSISTENT_SYNC", justification = "the value won't change after startup")
-    public void processConnectRequest(ServerCnxn cnxn, ByteBuffer incomingBuffer)
-        throws IOException, ClientCnxnLimitException {
-
-        BinaryInputArchive bia = BinaryInputArchive.getArchive(new ByteBufferInputStream(incomingBuffer));
-        ConnectRequest connReq = new ConnectRequest();
-        connReq.deserialize(bia, "connect");
+    public void processConnectRequest(ServerCnxn cnxn, ConnectRequest request) throws IOException, ClientCnxnLimitException {
         LOG.debug(
             "Session establishment request from client {} client's lastZxid is 0x{}",
             cnxn.getRemoteSocketAddress(),
-            Long.toHexString(connReq.getLastZxidSeen()));
+            Long.toHexString(request.getLastZxidSeen()));
 
-        long sessionId = connReq.getSessionId();
+        long sessionId = request.getSessionId();
         int tokensNeeded = 1;
         if (connThrottle.isConnectionWeightEnabled()) {
             if (sessionId == 0) {
@@ -1398,30 +1499,24 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             throw new ClientCnxnLimitException();
         }
         ServerMetrics.getMetrics().CONNECTION_TOKEN_DEFICIT.add(connThrottle.getDeficit());
-
         ServerMetrics.getMetrics().CONNECTION_REQUEST_COUNT.add(1);
 
-        boolean readOnly = false;
-        try {
-            readOnly = bia.readBool("readOnly");
-            cnxn.isOldClient = false;
-        } catch (IOException e) {
-            // this is ok -- just a packet from an old client which
-            // doesn't contain readOnly field
+        if (!cnxn.protocolManager.isReadonlyAvailable()) {
             LOG.warn(
                 "Connection request from old client {}; will be dropped if server is in r-o mode",
                 cnxn.getRemoteSocketAddress());
         }
-        if (!readOnly && this instanceof ReadOnlyZooKeeperServer) {
+
+        if (!request.getReadOnly() && this instanceof ReadOnlyZooKeeperServer) {
             String msg = "Refusing session request for not-read-only client " + cnxn.getRemoteSocketAddress();
             LOG.info(msg);
             throw new CloseRequestException(msg, ServerCnxn.DisconnectReason.NOT_READ_ONLY_CLIENT);
         }
-        if (connReq.getLastZxidSeen() > zkDb.dataTree.lastProcessedZxid) {
+        if (request.getLastZxidSeen() > zkDb.dataTree.lastProcessedZxid) {
             String msg = "Refusing session request for client "
                          + cnxn.getRemoteSocketAddress()
                          + " as it has seen zxid 0x"
-                         + Long.toHexString(connReq.getLastZxidSeen())
+                         + Long.toHexString(request.getLastZxidSeen())
                          + " our last zxid is 0x"
                          + Long.toHexString(getZKDatabase().getDataTreeLastProcessedZxid())
                          + " client must try another server";
@@ -1429,8 +1524,8 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             LOG.info(msg);
             throw new CloseRequestException(msg, ServerCnxn.DisconnectReason.CLIENT_ZXID_AHEAD);
         }
-        int sessionTimeout = connReq.getTimeOut();
-        byte[] passwd = connReq.getPasswd();
+        int sessionTimeout = request.getTimeOut();
+        byte[] passwd = request.getPasswd();
         int minSessionTimeout = getMinSessionTimeout();
         if (sessionTimeout < minSessionTimeout) {
             sessionTimeout = minSessionTimeout;
@@ -1448,16 +1543,16 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             LOG.debug(
                 "Client attempting to establish new session: session = 0x{}, zxid = 0x{}, timeout = {}, address = {}",
                 Long.toHexString(id),
-                Long.toHexString(connReq.getLastZxidSeen()),
-                connReq.getTimeOut(),
+                Long.toHexString(request.getLastZxidSeen()),
+                request.getTimeOut(),
                 cnxn.getRemoteSocketAddress());
         } else {
             validateSession(cnxn, sessionId);
             LOG.debug(
                 "Client attempting to renew session: session = 0x{}, zxid = 0x{}, timeout = {}, address = {}",
                 Long.toHexString(sessionId),
-                Long.toHexString(connReq.getLastZxidSeen()),
-                connReq.getTimeOut(),
+                Long.toHexString(request.getLastZxidSeen()),
+                request.getTimeOut(),
                 cnxn.getRemoteSocketAddress());
             if (serverCnxnFactory != null) {
                 serverCnxnFactory.closeSession(sessionId, ServerCnxn.DisconnectReason.CLIENT_RECONNECT);
@@ -1597,13 +1692,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         }
     }
 
-    public void processPacket(ServerCnxn cnxn, ByteBuffer incomingBuffer) throws IOException {
-        // We have the request, now process and setup for next
-        InputStream bais = new ByteBufferInputStream(incomingBuffer);
-        BinaryInputArchive bia = BinaryInputArchive.getArchive(bais);
-        RequestHeader h = new RequestHeader();
-        h.deserialize(bia, "header");
-
+    public void processPacket(ServerCnxn cnxn, RequestHeader h, RequestRecord request) throws IOException {
         // Need to increase the outstanding request count first, otherwise
         // there might be a race condition that it enabled recv after
         // processing request and then disabled when check throttling.
@@ -1615,14 +1704,9 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         // in cnxn, since it will close the cnxn anyway.
         cnxn.incrOutstandingAndCheckThrottle(h);
 
-        // Through the magic of byte buffers, txn will not be
-        // pointing
-        // to the start of the txn
-        incomingBuffer = incomingBuffer.slice();
         if (h.getType() == OpCode.auth) {
             LOG.info("got auth packet {}", cnxn.getRemoteSocketAddress());
-            AuthPacket authPacket = new AuthPacket();
-            ByteBufferInputStream.byteBuffer2Record(incomingBuffer, authPacket);
+            AuthPacket authPacket = request.readRecord(AuthPacket::new);
             String scheme = authPacket.getScheme();
             ServerAuthenticationProvider ap = ProviderRegistry.getServerProvider(scheme);
             Code authReturn = KeeperException.Code.AUTHFAILED;
@@ -1662,15 +1746,15 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             }
             return;
         } else if (h.getType() == OpCode.sasl) {
-            processSasl(incomingBuffer, cnxn, h);
+            processSasl(request, cnxn, h);
         } else {
             if (!authHelper.enforceAuthentication(cnxn, h.getXid())) {
                 // Authentication enforcement is failed
                 // Already sent response to user about failure and closed the session, lets return
                 return;
             } else {
-                Request si = new Request(cnxn, cnxn.getSessionId(), h.getXid(), h.getType(), incomingBuffer, cnxn.getAuthInfo());
-                int length = incomingBuffer.limit();
+                Request si = new Request(cnxn, cnxn.getSessionId(), h.getXid(), h.getType(), request, cnxn.getAuthInfo());
+                int length = request.limit();
                 if (isLargeRequest(length)) {
                     // checkRequestSize will throw IOException if request is rejected
                     checkRequestSizeWhenMessageReceived(length);
@@ -1708,10 +1792,9 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         return Boolean.getBoolean(ALLOW_SASL_FAILED_CLIENTS);
     }
 
-    private void processSasl(ByteBuffer incomingBuffer, ServerCnxn cnxn, RequestHeader requestHeader) throws IOException {
+    private void processSasl(RequestRecord request, ServerCnxn cnxn, RequestHeader requestHeader) throws IOException {
         LOG.debug("Responding to client SASL token.");
-        GetSASLRequest clientTokenRecord = new GetSASLRequest();
-        ByteBufferInputStream.byteBuffer2Record(incomingBuffer, clientTokenRecord);
+        GetSASLRequest clientTokenRecord = request.readRecord(GetSASLRequest::new);
         byte[] clientToken = clientTokenRecord.getToken();
         LOG.debug("Size of client SASL token: {}", clientToken.length);
         byte[] responseToken = null;
@@ -1918,6 +2001,15 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         rootContext.registerGauge("auth_failed_count", stats::getAuthFailedCount);
         rootContext.registerGauge("non_mtls_remote_conn_count", stats::getNonMTLSRemoteConnCount);
         rootContext.registerGauge("non_mtls_local_conn_count", stats::getNonMTLSLocalConnCount);
+
+        rootContext.registerGaugeSet(QuotaMetricsUtils.QUOTA_COUNT_LIMIT_PER_NAMESPACE,
+                () -> QuotaMetricsUtils.getQuotaCountLimit(zkDb.getDataTree()));
+        rootContext.registerGaugeSet(QuotaMetricsUtils.QUOTA_BYTES_LIMIT_PER_NAMESPACE,
+                () -> QuotaMetricsUtils.getQuotaBytesLimit(zkDb.getDataTree()));
+        rootContext.registerGaugeSet(QuotaMetricsUtils.QUOTA_COUNT_USAGE_PER_NAMESPACE,
+                () -> QuotaMetricsUtils.getQuotaCountUsage(zkDb.getDataTree()));
+        rootContext.registerGaugeSet(QuotaMetricsUtils.QUOTA_BYTES_USAGE_PER_NAMESPACE,
+                () -> QuotaMetricsUtils.getQuotaBytesUsage(zkDb.getDataTree()));
     }
 
     protected void unregisterMetrics() {
@@ -1957,7 +2049,10 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         rootContext.unregisterGauge("non_mtls_remote_conn_count");
         rootContext.unregisterGauge("non_mtls_local_conn_count");
 
-
+        rootContext.unregisterGaugeSet(QuotaMetricsUtils.QUOTA_COUNT_LIMIT_PER_NAMESPACE);
+        rootContext.unregisterGaugeSet(QuotaMetricsUtils.QUOTA_BYTES_LIMIT_PER_NAMESPACE);
+        rootContext.unregisterGaugeSet(QuotaMetricsUtils.QUOTA_COUNT_USAGE_PER_NAMESPACE);
+        rootContext.unregisterGaugeSet(QuotaMetricsUtils.QUOTA_BYTES_USAGE_PER_NAMESPACE);
     }
 
     /**
@@ -1974,7 +2069,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
 
     /**
      * Grant or deny authorization to an operation on a node as a function of:
-     * @param cnxn :    the server connection
+     * @param cnxn :    the server connection or null for admin server commands
      * @param acl :     set of ACLs for the node
      * @param perm :    the permission that the client is requesting
      * @param ids :     the credentials supplied by the client
@@ -2043,12 +2138,13 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             return;
         }
 
+        final String namespace = PathUtils.getTopNamespace(path);
         switch (type) {
             case OpCode.create:
-                checkQuota(lastPrefix, dataBytes, 1);
+                checkQuota(lastPrefix, dataBytes, 1, namespace);
                 break;
             case OpCode.setData:
-                checkQuota(lastPrefix, dataBytes - (lastData == null ? 0 : lastData.length), 0);
+                checkQuota(lastPrefix, dataBytes - (lastData == null ? 0 : lastData.length), 0, namespace);
                 break;
              default:
                  throw new IllegalArgumentException("Unsupported OpCode for checkQuota: " + type);
@@ -2064,8 +2160,10 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
      *            the diff to be added to number of bytes
      * @param countDiff
      *            the diff to be added to the count
+     * @param namespace
+      *           the namespace for collecting quota exceeded errors
      */
-    private void checkQuota(String lastPrefix, long bytesDiff, long countDiff)
+    private void checkQuota(String lastPrefix, long bytesDiff, long countDiff, String namespace)
             throws KeeperException.QuotaExceededException {
         LOG.debug("checkQuota: lastPrefix={}, bytesDiff={}, countDiff={}", lastPrefix, bytesDiff, countDiff);
 
@@ -2106,13 +2204,14 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         //check the Count Quota
         if (checkCountQuota) {
             long newCount = currentStats.getCount() + countDiff;
-            boolean isCountHardLimit = limitStats.getCountHardLimit() > -1 ? true : false;
+            boolean isCountHardLimit = limitStats.getCountHardLimit() > -1;
             long countLimit = isCountHardLimit ? limitStats.getCountHardLimit() : limitStats.getCount();
 
             if (newCount > countLimit) {
                 String msg = "Quota exceeded: " + lastPrefix + " [current count=" + newCount + ", " + (isCountHardLimit ? "hard" : "soft") + "CountLimit=" + countLimit + "]";
                 RATE_LOGGER.rateLimitLog(msg);
                 if (isCountHardLimit) {
+                    updateQuotaExceededMetrics(namespace);
                     throw new KeeperException.QuotaExceededException(lastPrefix);
                 }
             }
@@ -2121,12 +2220,13 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         //check the Byte Quota
         if (checkByteQuota) {
             long newBytes = currentStats.getBytes() + bytesDiff;
-            boolean isByteHardLimit = limitStats.getByteHardLimit() > -1 ? true : false;
+            boolean isByteHardLimit = limitStats.getByteHardLimit() > -1;
             long byteLimit = isByteHardLimit ? limitStats.getByteHardLimit() : limitStats.getBytes();
             if (newBytes > byteLimit) {
                 String msg = "Quota exceeded: " + lastPrefix + " [current bytes=" + newBytes + ", " + (isByteHardLimit ? "hard" : "soft") + "ByteLimit=" + byteLimit + "]";
                 RATE_LOGGER.rateLimitLog(msg);
                 if (isByteHardLimit) {
+                    updateQuotaExceededMetrics(namespace);
                     throw new KeeperException.QuotaExceededException(lastPrefix);
                 }
             }
@@ -2140,6 +2240,15 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     public static void setDigestEnabled(boolean digestEnabled) {
         LOG.info("{} = {}", ZOOKEEPER_DIGEST_ENABLED, digestEnabled);
         ZooKeeperServer.digestEnabled = digestEnabled;
+    }
+
+    public static boolean isSerializeLastProcessedZxidEnabled() {
+        return serializeLastProcessedZxidEnabled;
+    }
+
+    public static void setSerializeLastProcessedZxidEnabled(boolean serializeLastZxidEnabled) {
+        serializeLastProcessedZxidEnabled = serializeLastZxidEnabled;
+        LOG.info("{} = {}", ZOOKEEPER_SERIALIZE_LAST_PROCESSED_ZXID_ENABLED, serializeLastZxidEnabled);
     }
 
     /**
@@ -2165,8 +2274,8 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         switch (request.type) {
         case OpCode.create:
         case OpCode.create2: {
-            CreateRequest req = new CreateRequest();
-            if (buffer2Record(request.request, req)) {
+            CreateRequest req = request.readRequestRecordNoException(CreateRequest::new);
+            if (req != null) {
                 mustCheckACL = true;
                 acl = req.getAcl();
                 path = parentPath(req.getPath());
@@ -2174,22 +2283,22 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             break;
         }
         case OpCode.delete: {
-            DeleteRequest req = new DeleteRequest();
-            if (buffer2Record(request.request, req)) {
+            DeleteRequest req = request.readRequestRecordNoException(DeleteRequest::new);
+            if (req != null) {
                 path = parentPath(req.getPath());
             }
             break;
         }
         case OpCode.setData: {
-            SetDataRequest req = new SetDataRequest();
-            if (buffer2Record(request.request, req)) {
+            SetDataRequest req = request.readRequestRecordNoException(SetDataRequest::new);
+            if (req != null) {
                 path = req.getPath();
             }
             break;
         }
         case OpCode.setACL: {
-            SetACLRequest req = new SetACLRequest();
-            if (buffer2Record(request.request, req)) {
+            SetACLRequest req = request.readRequestRecordNoException(SetACLRequest::new);
+            if (req != null) {
                 mustCheckACL = true;
                 acl = req.getAcl();
                 path = req.getPath();
@@ -2283,18 +2392,6 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         return err == KeeperException.Code.OK.intValue();
     }
 
-    private boolean buffer2Record(ByteBuffer request, Record record) {
-        boolean rv = false;
-        try {
-            ByteBufferInputStream.byteBuffer2Record(request, record);
-            request.rewind();
-            rv = true;
-        } catch (IOException ex) {
-        }
-
-        return rv;
-    }
-
     public int getOutstandingHandshakeNum() {
         if (serverCnxnFactory instanceof NettyServerCnxnFactory) {
             return ((NettyServerCnxnFactory) serverCnxnFactory).getOutstandingHandshakeNum();
@@ -2311,4 +2408,11 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         return zkShutdownHandler;
     }
 
+    static void updateQuotaExceededMetrics(final String namespace) {
+        if (namespace == null) {
+            return;
+        }
+        ServerMetrics.getMetrics().QUOTA_EXCEEDED_ERROR_PER_NAMESPACE.add(namespace, 1);
+    }
 }
+

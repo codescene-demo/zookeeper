@@ -25,7 +25,6 @@ import java.util.List;
 import java.util.Map;
 import org.apache.yetus.audience.InterfaceAudience;
 
-@SuppressWarnings("serial")
 @InterfaceAudience.Public
 public abstract class KeeperException extends Exception {
 
@@ -154,7 +153,7 @@ public abstract class KeeperException extends Exception {
             return new ThrottledOpException();
         case OK:
         default:
-            throw new IllegalArgumentException("Invalid exception code");
+            throw new IllegalArgumentException("Invalid exception code:" + code.code);
         }
     }
 
@@ -182,6 +181,7 @@ public abstract class KeeperException extends Exception {
      * interface should be private, but it's declared public to enable
      * javadoc to include in the user API spec.
      */
+    @SuppressWarnings("DeprecatedIsStillUsed") // still used in Code - kept until 4.0
     @Deprecated
     @InterfaceAudience.Public
     public interface CodeDeprecated {
@@ -417,7 +417,7 @@ public abstract class KeeperException extends Exception {
          */
         THROTTLEDOP (-127);
 
-        private static final Map<Integer, Code> lookup = new HashMap<Integer, Code>();
+        private static final Map<Integer, Code> lookup = new HashMap<>();
 
         static {
             for (Code c : EnumSet.allOf(Code.class)) {
@@ -441,10 +441,14 @@ public abstract class KeeperException extends Exception {
         /**
          * Get the Code value for a particular integer error code
          * @param code int error code
-         * @return Code value corresponding to specified int code, or null
+         * @return Code value corresponding to specified int code, if null throws IllegalArgumentException
          */
         public static Code get(int code) {
-            return lookup.get(code);
+            Code codeVal = lookup.get(code);
+            if (codeVal == null) {
+                throw new IllegalArgumentException("The current client version cannot lookup this code:" + code);
+            }
+            return codeVal;
         }
     }
 

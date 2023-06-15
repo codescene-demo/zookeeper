@@ -18,9 +18,11 @@
 
 package org.apache.zookeeper;
 
+import static org.apache.zookeeper.KeeperException.Code.NOAUTH;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import java.io.ByteArrayOutputStream;
@@ -31,6 +33,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.zookeeper.AsyncCallback.VoidCallback;
+import org.apache.zookeeper.KeeperException.Code;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.cli.CliCommand;
 import org.apache.zookeeper.cli.CliException;
@@ -547,7 +550,7 @@ public class ZooKeeperTest extends ClientBase {
         LsCommand cmd = new LsCommand();
         cmd.setZk(zk);
         cmd.parse("ls /".split(" "));
-        List<String> expected = new ArrayList<String>();
+        List<String> expected = new ArrayList<>();
         expected.add("[aa1, aa2, aa3, test1, zk1, zookeeper]");
         runCommandExpect(cmd, expected);
     }
@@ -568,7 +571,7 @@ public class ZooKeeperTest extends ClientBase {
         cmd.setZk(zk);
         cmd.parse("ls -R /a".split(" "));
 
-        List<String> expected = new ArrayList<String>();
+        List<String> expected = new ArrayList<>();
         expected.add("/a");
         expected.add("/a/b");
         expected.add("/a/c");
@@ -587,7 +590,7 @@ public class ZooKeeperTest extends ClientBase {
         cmd.setZk(zk);
         cmd.parse("ls -R /".split(" "));
 
-        List<String> expected = new ArrayList<String>();
+        List<String> expected = new ArrayList<>();
         expected.add("/");
         expected.add("/zookeeper");
         runCommandExpect(cmd, expected);
@@ -605,7 +608,7 @@ public class ZooKeeperTest extends ClientBase {
         cmd.setZk(zk);
         cmd.parse("ls -R /b/c".split(" "));
 
-        List<String> expected = new ArrayList<String>();
+        List<String> expected = new ArrayList<>();
         expected.add("/b/c");
         runCommandExpect(cmd, expected);
     }
@@ -623,7 +626,7 @@ public class ZooKeeperTest extends ClientBase {
         cmd.parse("ls -R /b/c/d".split(" "));
 
         try {
-            runCommandExpect(cmd, new ArrayList<String>());
+            runCommandExpect(cmd, new ArrayList<>());
             fail("Path doesn't exists so, command should fail.");
         } catch (CliWrapperException e) {
             assertEquals(KeeperException.Code.NONODE, ((KeeperException) e.getCause()).code());
@@ -688,7 +691,7 @@ public class ZooKeeperTest extends ClientBase {
         SyncCommand cmd = new SyncCommand();
         cmd.setZk(zk);
         cmd.parse("sync /".split(" "));
-        List<String> expected = new ArrayList<String>();
+        List<String> expected = new ArrayList<>();
         expected.add("Sync is OK");
 
         runCommandExpect(cmd, expected);
@@ -800,6 +803,16 @@ public class ZooKeeperTest extends ClientBase {
         assertTrue(endTime - startTime >= timeout,
                 "ZooKeeeperMain does not wait until the specified timeout");
 
+    }
+
+    @Test
+    public void testKeeperExceptionCreateNPE() {
+        // One existing code
+        KeeperException k1 = KeeperException.create(Code.get(NOAUTH.intValue()));
+        assertTrue(k1 instanceof KeeperException.NoAuthException);
+
+        // One impossible code
+        assertThrows(IllegalArgumentException.class, () -> KeeperException.create(Code.get(Integer.MAX_VALUE)));
     }
 
 }

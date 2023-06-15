@@ -43,6 +43,7 @@ import org.apache.jute.BinaryOutputArchive;
 import org.apache.jute.InputArchive;
 import org.apache.jute.OutputArchive;
 import org.apache.jute.Record;
+import org.apache.zookeeper.server.Request;
 import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.server.ServerStats;
 import org.apache.zookeeper.server.TxnLogEntry;
@@ -276,7 +277,7 @@ public class FileTxnLog implements TxnLog, Closeable {
                 "Current zxid {} is <= {} for {}",
                 hdr.getZxid(),
                 lastZxidSeen,
-                hdr.getType());
+                Request.op2String(hdr.getType()));
         } else {
             lastZxidSeen = hdr.getZxid();
         }
@@ -331,7 +332,7 @@ public class FileTxnLog implements TxnLog, Closeable {
                 logZxid = fzxid;
             }
         }
-        List<File> v = new ArrayList<File>(5);
+        List<File> v = new ArrayList<>(5);
         for (File f : files) {
             long fzxid = Util.getZxidFromName(f.getName(), LOG_FILE_PREFIX);
             if (fzxid < logZxid) {

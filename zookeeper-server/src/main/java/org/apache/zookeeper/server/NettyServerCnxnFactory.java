@@ -85,6 +85,7 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
      * Allow client-server sockets to accept both SSL and plaintext connections
      */
     public static final String PORT_UNIFICATION_KEY = "zookeeper.client.portUnification";
+    public static final String EARLY_DROP_SECURE_CONNECTION_HANDSHAKES = "zookeeper.netty.server.earlyDropSecureConnectionHandshakes";
     private final boolean shouldUsePortUnification;
 
     /**
@@ -122,6 +123,8 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
     private static final AttributeKey<NettyServerCnxn> CONNECTION_ATTRIBUTE = AttributeKey.valueOf("NettyServerCnxn");
 
     private static final AtomicReference<ByteBufAllocator> TEST_ALLOCATOR = new AtomicReference<>(null);
+
+    public static final String CLIENT_CERT_RELOAD_KEY = "zookeeper.client.certReload";
 
     /**
      * A handler that detects whether the client would like to use
@@ -227,11 +230,15 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
 
             // Check the zkServer assigned to the cnxn is still running,
             // close it before starting the heavy TLS handshake
-            if (!cnxn.isZKServerRunning()) {
-                LOG.warn("Zookeeper server is not running, close the connection before starting the TLS handshake");
-                ServerMetrics.getMetrics().CNXN_CLOSED_WITHOUT_ZK_SERVER_RUNNING.add(1);
-                channel.close();
-                return;
+            if (secure && !cnxn.isZKServerRunning()) {
+                boolean earlyDropSecureConnectionHandshakes = Boolean.getBoolean(EARLY_DROP_SECURE_CONNECTION_HANDSHAKES);
+                if (earlyDropSecureConnectionHandshakes) {
+                    LOG.info("Zookeeper server is not running, close the connection to {} before starting the TLS handshake",
+                            cnxn.getChannel().remoteAddress());
+                    ServerMetrics.getMetrics().CNXN_CLOSED_WITHOUT_ZK_SERVER_RUNNING.add(1);
+                    channel.close();
+                    return;
+                }
             }
 
             if (handshakeThrottlingEnabled) {
@@ -259,14 +266,20 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
                 allChannels.add(ctx.channel());
                 addCnxn(cnxn);
             }
+
             if (ctx.channel().pipeline().get(SslHandler.class) == null) {
-                SocketAddress remoteAddress = cnxn.getChannel().remoteAddress();
-                if (remoteAddress != null
-                        && !((InetSocketAddress) remoteAddress).getAddress().isLoopbackAddress()) {
-                    LOG.trace("NettyChannelHandler channelActive: remote={} local={}", remoteAddress, cnxn.getChannel().localAddress());
-                    zkServer.serverStats().incrementNonMTLSRemoteConnCount();
+                if (zkServer != null) {
+                    SocketAddress remoteAddress = cnxn.getChannel().remoteAddress();
+                    if (remoteAddress != null
+                            && !((InetSocketAddress) remoteAddress).getAddress().isLoopbackAddress()) {
+                        LOG.trace("NettyChannelHandler channelActive: remote={} local={}", remoteAddress, cnxn.getChannel().localAddress());
+                        zkServer.serverStats().incrementNonMTLSRemoteConnCount();
+                    } else {
+                        zkServer.serverStats().incrementNonMTLSLocalConnCount();
+                    }
                 } else {
-                    zkServer.serverStats().incrementNonMTLSLocalConnCount();
+                    LOG.trace("Opened non-TLS connection from {} but zkServer is not running",
+                            cnxn.getChannel().remoteAddress());
                 }
             }
         }
@@ -503,7 +516,19 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
     NettyServerCnxnFactory() {
         x509Util = new ClientX509Util();
 
+        boolean useClientReload = Boolean.getBoolean(CLIENT_CERT_RELOAD_KEY);
+        LOG.info("{}={}", CLIENT_CERT_RELOAD_KEY, useClientReload);
+        if (useClientReload) {
+            try {
+                x509Util.enableCertFileReloading();
+            } catch (IOException e) {
+                LOG.error("unable to set up client certificate reload filewatcher", e);
+                useClientReload = false;
+            }
+        }
+
         boolean usePortUnification = Boolean.getBoolean(PORT_UNIFICATION_KEY);
+
         LOG.info("{}={}", PORT_UNIFICATION_KEY, usePortUnification);
         if (usePortUnification) {
             try {
@@ -784,7 +809,7 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
 
     @Override
     public Iterable<Map<String, Object>> getAllConnectionInfo(boolean brief) {
-        Set<Map<String, Object>> info = new HashSet<Map<String, Object>>();
+        Set<Map<String, Object>> info = new HashSet<>();
         // No need to synchronize since cnxns is backed by a ConcurrentHashMap
         for (ServerCnxn c : cnxns) {
             info.add(c.getConnectionInfo(brief));

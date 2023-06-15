@@ -70,11 +70,6 @@ then
     ZOO_LOG_DIR="$ZOOKEEPER_PREFIX/logs"
 fi
 
-if [ "x${ZOO_LOG4J_PROP}" = "x" ]
-then
-    ZOO_LOG4J_PROP="INFO,CONSOLE"
-fi
-
 if [[ -n "$JAVA_HOME" ]] && [[ -x "$JAVA_HOME/bin/java" ]];  then
     JAVA="$JAVA_HOME/bin/java"
 elif type -p java; then
@@ -116,7 +111,14 @@ do
    CLASSPATH="$d:$CLASSPATH"
 done
 
+#make it work for developers
 for d in "$ZOOBINDIR"/../zookeeper-server/target/lib/*.jar
+do
+   CLASSPATH="$d:$CLASSPATH"
+done
+
+#make it work for developers
+for d in "$ZOOBINDIR"/../zookeeper-metrics-providers/zookeeper-prometheus-metrics/target/lib/*.jar
 do
    CLASSPATH="$d:$CLASSPATH"
 done
@@ -126,6 +128,9 @@ CLASSPATH="$ZOOBINDIR/../build/classes:$CLASSPATH"
 
 #make it work for developers
 CLASSPATH="$ZOOBINDIR/../zookeeper-server/target/classes:$CLASSPATH"
+
+#make it work for developers
+CLASSPATH="$ZOOBINDIR/../zookeeper-metrics-providers/zookeeper-prometheus-metrics/target/classes:$CLASSPATH"
 
 case "`uname`" in
     CYGWIN*|MINGW*) cygwin=true ;;

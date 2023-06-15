@@ -55,6 +55,7 @@ import org.apache.zookeeper.ZooKeeper.States;
 import org.apache.zookeeper.admin.ZooKeeperAdmin;
 import org.apache.zookeeper.jmx.MBeanRegistry;
 import org.apache.zookeeper.jmx.ZKMBeanInfo;
+import org.apache.zookeeper.metrics.MetricsUtils;
 import org.apache.zookeeper.server.admin.Commands;
 import org.apache.zookeeper.server.quorum.QuorumPeerConfig;
 import org.apache.zookeeper.server.util.PortForwarder;
@@ -84,6 +85,8 @@ public class ObserverMasterTest extends ObserverMasterTestBase {
         q3.start();
         assertTrue(ClientBase.waitForServerUp("127.0.0.1:" + CLIENT_PORT_OBS, CONNECTION_TIMEOUT),
                 "waiting for server 3 being up");
+
+        validateObserverSyncTimeMetrics();
 
         if (testObserverMaster) {
             int masterPort = q3.getQuorumPeer().observer.getSocket().getPort();
@@ -290,7 +293,7 @@ public class ObserverMasterTest extends ObserverMasterTestBase {
 
         // test stats collection
         final Map<String, String> emptyMap = Collections.emptyMap();
-        Map<String, Object> stats = Commands.runCommand("mntr", q3.getQuorumPeer().getActiveServer(), emptyMap).toMap();
+        Map<String, Object> stats = Commands.runGetCommand("mntr", q3.getQuorumPeer().getActiveServer(), emptyMap, null, null).toMap();
         assertTrue(stats.containsKey("observer_master_id"), "observer not emitting observer_master_id");
 
         // check the stats for the first peer
@@ -327,7 +330,7 @@ public class ObserverMasterTest extends ObserverMasterTestBase {
         ObjectName connBean = null;
         for (ObjectName bean : JMXEnv.conn().queryNames(new ObjectName(MBeanRegistry.DOMAIN + ":*"), null)) {
             if (bean.getCanonicalName().contains("Learner_Connections") && bean.getCanonicalName().contains("id:"
-                                                                                                                    + q3.getQuorumPeer().getId())) {
+                                                                                                                    + q3.getQuorumPeer().getMyId())) {
                 connBean = bean;
                 break;
             }
@@ -341,7 +344,7 @@ public class ObserverMasterTest extends ObserverMasterTestBase {
         assertTrue(ClientBase.waitForServerUp("127.0.0.1:" + CLIENT_PORT_OBS, CONNECTION_TIMEOUT),
                 "waiting for server 3 being up");
 
-        final String obsBeanName = String.format("org.apache.ZooKeeperService:name0=ReplicatedServer_id%d,name1=replica.%d,name2=Observer", q3.getQuorumPeer().getId(), q3.getQuorumPeer().getId());
+        final String obsBeanName = String.format("org.apache.ZooKeeperService:name0=ReplicatedServer_id%d,name1=replica.%d,name2=Observer", q3.getQuorumPeer().getMyId(), q3.getQuorumPeer().getMyId());
         Set<ObjectName> names = JMXEnv.conn().queryNames(new ObjectName(obsBeanName), null);
         assertEquals(1, names.size(), "expecting singular observer bean");
         ObjectName obsBean = names.iterator().next();
@@ -436,7 +439,7 @@ public class ObserverMasterTest extends ObserverMasterTestBase {
         waitServerUp(observerClientPort);
 
         // create a client to the observer
-        final LinkedBlockingQueue<KeeperState> states = new LinkedBlockingQueue<KeeperState>();
+        final LinkedBlockingQueue<KeeperState> states = new LinkedBlockingQueue<>();
         ZooKeeper observerClient = new ZooKeeper(
             "127.0.0.1:" + observerClientPort,
             ClientBase.CONNECTION_TIMEOUT,
@@ -453,7 +456,7 @@ public class ObserverMasterTest extends ObserverMasterTestBase {
         assertEquals(KeeperState.SyncConnected, state);
 
         // issue reconfig command
-        ArrayList<String> newServers = new ArrayList<String>();
+        ArrayList<String> newServers = new ArrayList<>();
         String server = "server.3=127.0.0.1:" + PortAssignment.unique() + ":" + PortAssignment.unique() + ":participant;localhost:" + PortAssignment.unique();
         newServers.add(server);
         ZooKeeperAdmin admin = createAdmin(clientPort1);
@@ -522,4 +525,15 @@ public class ObserverMasterTest extends ObserverMasterTestBase {
 
     }
 
+    private void validateObserverSyncTimeMetrics() {
+        final String name = "observer_sync_time";
+        final Map<String, Object> metrics = MetricsUtils.currentServerMetrics();
+
+        assertEquals(5, metrics.keySet().stream().filter(key -> key.contains(name)).count());
+        assertNotNull(metrics.get(String.format("avg_%s", name)));
+        assertNotNull(metrics.get(String.format("min_%s", name)));
+        assertNotNull(metrics.get(String.format("max_%s", name)));
+        assertNotNull(metrics.get(String.format("cnt_%s", name)));
+        assertNotNull(metrics.get(String.format("sum_%s", name)));
+    }
 }

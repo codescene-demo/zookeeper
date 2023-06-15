@@ -1,5 +1,5 @@
 <!--
-Copyright 2002-2021 The Apache Software Foundation
+Copyright 2002-2022 The Apache Software Foundation
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ limitations under the License.
     * [zkCleanup.sh](#zkCleanup)
     * [zkTxnLogToolkit.sh](#zkTxnLogToolkit)
     * [zkSnapShotToolkit.sh](#zkSnapShotToolkit)
+    * [zkSnapshotRecursiveSummaryToolkit.sh](#zkSnapshotRecursiveSummaryToolkit)
     * [zkSnapshotComparer.sh](#zkSnapshotComparer)
 
 * [Benchmark](#Benchmark)
@@ -30,6 +31,8 @@ limitations under the License.
     * [zk-smoketest](#zk-smoketest)
     
 * [Testing](#Testing)
+    * [Fault Injection Framework](#fault-injection)
+        * [Byteman](#Byteman)
     * [Jepsen Test](#jepsen-test)
     
 <a name="Scripts"></a>
@@ -94,7 +97,6 @@ The environment setting for the ZooKeeper server
 ```bash
 # the setting of log property
 ZOO_LOG_DIR: the directory to store the logs
-ZOO_LOG4J_PROP: the level of logs to print
 ```
 
 <a name="zkCleanup"></a>
@@ -216,6 +218,43 @@ USAGE: SnapshotFormatter [-d|-json] snapshot_file
 # [-json] show the each zk-node info with json format
 ./zkSnapShotToolkit.sh -json /data/zkdata/version-2/snapshot.fa01000186d
 [[1,0,{"progname":"SnapshotFormatter.java","progver":"0.01","timestamp":1559788148637},[{"name":"\/","asize":0,"dsize":0,"dev":0,"ino":1001},[{"name":"zookeeper","asize":0,"dsize":0,"dev":0,"ino":1002},{"name":"config","asize":0,"dsize":0,"dev":0,"ino":1003},[{"name":"quota","asize":0,"dsize":0,"dev":0,"ino":1004},[{"name":"test","asize":0,"dsize":0,"dev":0,"ino":1005},{"name":"zookeeper_limits","asize":52,"dsize":52,"dev":0,"ino":1006},{"name":"zookeeper_stats","asize":15,"dsize":15,"dev":0,"ino":1007}]]],{"name":"test","asize":0,"dsize":0,"dev":0,"ino":1008}]]
+```
+<a name="zkSnapshotRecursiveSummaryToolkit"></a>
+
+### zkSnapshotRecursiveSummaryToolkit.sh
+Recursively collect and display child count and data size for a selected node.
+
+    $./zkSnapshotRecursiveSummaryToolkit.sh
+    USAGE:
+    
+    SnapshotRecursiveSummary  <snapshot_file>  <starting_node>  <max_depth>
+    
+    snapshot_file:    path to the zookeeper snapshot
+    starting_node:    the path in the zookeeper tree where the traversal should begin
+    max_depth:        defines the depth where the tool still writes to the output. 0 means there is no depth limit, every non-leaf node's stats will be displayed, 1 means it will only contain the starting node's and it's children's stats, 2 ads another level and so on. This ONLY affects the level of details displayed, NOT the calculation.
+
+```bash
+# recursively collect and display child count and data for the root node and 2 levels below it
+./zkSnapshotRecursiveSummaryToolkit.sh /data/zkdata/version-2/snapshot.fa01000186d / 2
+
+/
+   children: 1250511
+   data: 1952186580
+-- /zookeeper
+--   children: 1
+--   data: 0
+-- /solr
+--   children: 1773
+--   data: 8419162
+---- /solr/configs
+----   children: 1640
+----   data: 8407643
+---- /solr/overseer
+----   children: 6
+----   data: 0
+---- /solr/live_nodes
+----   children: 3
+----   data: 0
 ```
 
 <a name="zkSnapshotComparer"></a>
@@ -525,6 +564,87 @@ existing installations. More details are [here](https://github.com/phunt/zk-smok
 <a name="Testing"></a>
 
 ## Testing
+
+<a name="fault-injection"></a>
+
+### Fault Injection Framework
+
+<a name="Byteman"></a>
+
+#### Byteman
+
+- **Byteman** is a tool which makes it easy to trace, monitor and test the behaviour of Java application and JDK runtime code.
+It injects Java code into your application methods or into Java runtime methods without the need for you to recompile, repackage or even redeploy your application.
+Injection can be performed at JVM startup or after startup while the application is still running.
+- Visit the official [website](https://byteman.jboss.org/) to download the latest release
+- A brief tutorial can be found [here](https://developer.jboss.org/wiki/ABytemanTutorial)
+
+    ```bash
+    Preparations:
+    # attach the byteman to 3 zk servers during runtime
+    # 55001,55002,55003 is byteman binding port; 714,740,758 is the zk server pid
+    ./bminstall.sh -b -Dorg.jboss.byteman.transform.all -Dorg.jboss.byteman.verbose -p 55001 714
+    ./bminstall.sh -b -Dorg.jboss.byteman.transform.all -Dorg.jboss.byteman.verbose -p 55002 740
+    ./bminstall.sh -b -Dorg.jboss.byteman.transform.all -Dorg.jboss.byteman.verbose -p 55003 758
+
+    # load the fault injection script
+    ./bmsubmit.sh -p 55002 -l my_zk_fault_injection.btm
+    # unload the fault injection script
+    ./bmsubmit.sh -p 55002 -u my_zk_fault_injectionr.btm
+    ```
+
+Look at the below examples to customize your byteman fault injection script
+
+Example 1: This script makes leader's zxid roll over, to force re-election.
+
+```bash
+cat zk_leader_zxid_roll_over.btm
+
+RULE trace zk_leader_zxid_roll_over
+CLASS org.apache.zookeeper.server.quorum.Leader
+METHOD propose
+IF true
+DO
+  traceln("*** Leader zxid has rolled over, forcing re-election ***");
+  $1.zxid = 4294967295L
+ENDRULE
+```
+
+Example 2: This script makes the leader drop the ping packet to a specific follower.
+The leader will close the **LearnerHandler** with that follower, and the follower will enter the state:LOOKING
+then re-enter the quorum with the state:FOLLOWING
+
+```bash
+cat zk_leader_drop_ping_packet.btm
+
+RULE trace zk_leader_drop_ping_packet
+CLASS org.apache.zookeeper.server.quorum.LearnerHandler
+METHOD ping
+AT ENTRY
+IF $0.sid == 2
+DO
+  traceln("*** Leader drops ping packet to sid: 2 ***");
+  return;
+ENDRULE
+```
+
+Example 3: This script makes one follower drop ACK packet which has no big effect in the broadcast phrase, since after receiving
+the majority of ACKs from the followers, the leader can commit that proposal
+
+```bash
+cat zk_leader_drop_ping_packet.btm
+
+RULE trace zk.follower_drop_ack_packet
+CLASS org.apache.zookeeper.server.quorum.SendAckRequestProcessor
+METHOD processRequest
+AT ENTRY
+IF true
+DO
+  traceln("*** Follower drops ACK packet ***");
+  return;
+ENDRULE
+```
+
 
 <a name="jepsen-test"></a>
 

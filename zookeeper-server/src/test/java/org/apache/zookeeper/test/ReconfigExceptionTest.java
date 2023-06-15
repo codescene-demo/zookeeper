@@ -48,8 +48,8 @@ public class ReconfigExceptionTest extends ZKTestCase {
     // Use DigestAuthenticationProvider.base64Encode or
     // run ZooKeeper jar with org.apache.zookeeper.server.auth.DigestAuthenticationProvider to generate password.
     // An example:
-    // java -cp zookeeper-3.6.0-SNAPSHOT.jar:lib/log4j-1.2.17.jar:lib/slf4j-log4j12-1.7.5.jar:
-    // lib/slf4j-api-1.7.5.jar org.apache.zookeeper.server.auth.DigestAuthenticationProvider super:test
+    // java -cp zookeeper.jar:lib/slf4j-api-1.7.30.jar:lib/logback-classic-1.2.10.jar:lib/logback-core-1.2.10.jar:conf
+    // org.apache.zookeeper.server.auth.DigestAuthenticationProvider super:test
     // The password here is 'test'.
     private static String superDigest = "super:D/InIHSb7yEEbrWz8b9l71RjZJU=";
     private QuorumUtil qu;
@@ -156,7 +156,7 @@ public class ReconfigExceptionTest extends ZKTestCase {
         try {
             zkAdmin.addAuthInfo("digest", "super:test".getBytes());
             // There is ACL however the permission is wrong - need WRITE permission at leaste.
-            ArrayList<ACL> acls = new ArrayList<ACL>(Collections.singletonList(new ACL(ZooDefs.Perms.READ, new Id("digest", "user:tl+z3z0vO6PfPfEENfLF96E6pM0="/* password is test */))));
+            ArrayList<ACL> acls = new ArrayList<>(Collections.singletonList(new ACL(ZooDefs.Perms.READ, new Id("digest", "user:tl+z3z0vO6PfPfEENfLF96E6pM0="/* password is test */))));
             zkAdmin.setACL(ZooDefs.CONFIG_NODE, acls, -1);
             resetZKAdmin();
             zkAdmin.addAuthInfo("digest", "user:test".getBytes());
@@ -174,7 +174,7 @@ public class ReconfigExceptionTest extends ZKTestCase {
 
         try {
             zkAdmin.addAuthInfo("digest", "super:test".getBytes());
-            ArrayList<ACL> acls = new ArrayList<ACL>(Collections.singletonList(new ACL(ZooDefs.Perms.WRITE, new Id("digest", "user:tl+z3z0vO6PfPfEENfLF96E6pM0="/* password is test */))));
+            ArrayList<ACL> acls = new ArrayList<>(Collections.singletonList(new ACL(ZooDefs.Perms.WRITE, new Id("digest", "user:tl+z3z0vO6PfPfEENfLF96E6pM0="/* password is test */))));
             zkAdmin.setACL(ZooDefs.CONFIG_NODE, acls, -1);
             resetZKAdmin();
             zkAdmin.addAuthInfo("digest", "user:test".getBytes());
@@ -208,7 +208,7 @@ public class ReconfigExceptionTest extends ZKTestCase {
     }
 
     private boolean reconfigPort() throws KeeperException, InterruptedException {
-        List<String> joiningServers = new ArrayList<String>();
+        List<String> joiningServers = new ArrayList<>();
         int leaderId = 1;
         while (qu.getPeer(leaderId).peer.leader == null) {
             leaderId++;

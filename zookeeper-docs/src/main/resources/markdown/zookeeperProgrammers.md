@@ -219,7 +219,7 @@ name "<path>-2147483648").
 
 #### Container Nodes
 
-**Added in 3.6.0**
+**Added in 3.5.3**
 
 ZooKeeper has the notion of container znodes. Container znodes are
 special purpose znodes useful for recipes such as leader, lock, etc.
@@ -236,7 +236,7 @@ znode when it occurs.
 
 #### TTL Nodes
 
-**Added in 3.6.0**
+**Added in 3.5.3**
 
 When creating PERSISTENT or PERSISTENT_SEQUENTIAL znodes,
 you can optionally set a TTL in milliseconds for the znode. If the znode
@@ -1341,11 +1341,19 @@ and [SASL authentication for ZooKeeper](https://cwiki.apache.org/confluence/disp
     **New in 3.5.5:**
     Specifies the file path to a JKS containing the local credentials to be used for SSL connections,
     and the password to unlock the file.
-
+    
+* *zookeeper.ssl.keyStore.passwordPath* :
+    **New in 3.8.0:**
+    Specifies the file path which contains the keystore password    
+    
 * *zookeeper.ssl.trustStore.location and zookeeper.ssl.trustStore.password* :
     **New in 3.5.5:**
     Specifies the file path to a JKS containing the remote credentials to be used for SSL connections,
     and the password to unlock the file.
+    
+* *zookeeper.ssl.trustStore.passwordPath* :
+    **New in 3.8.0:**
+    Specifies the file path which contains the truststore password       
 
 * *zookeeper.ssl.keyStore.type* and *zookeeper.ssl.trustStore.type*:
     **New in 3.5.5:**
@@ -1393,8 +1401,7 @@ If you're building the client from a check-out from the Apache
 repository, follow the steps outlined below. If you're building from a
 project source package downloaded from apache, skip to step **3**.
 
-1. Run `ant compile_jute` from the ZooKeeper
-  top level directory (*.../trunk*).
+1. Run `mvn compile` in zookeeper-jute directory (*.../trunk/zookeeper-jute*).
   This will create a directory named "generated" under
   *.../trunk/zookeeper-client/zookeeper-client-c*.
 1. Change directory to the*.../trunk/zookeeper-client/zookeeper-client-c*

@@ -226,7 +226,7 @@ public class ZooKeeper implements AutoCloseable {
     }
 
     public ZooKeeperSaslClient getSaslClient() {
-        return cnxn.zooKeeperSaslClient;
+        return cnxn.getZooKeeperSaslClient();
     }
 
     private final ZKClientConfig clientConfig;
@@ -285,7 +285,7 @@ public class ZooKeeper implements AutoCloseable {
                 synchronized (watches) {
                     Set<Watcher> watchers = watches.get(clientPath);
                     if (watchers == null) {
-                        watchers = new HashSet<Watcher>();
+                        watchers = new HashSet<>();
                         watches.put(clientPath, watchers);
                     }
                     watchers.add(watcher);
@@ -1665,7 +1665,7 @@ public class ZooKeeper implements AutoCloseable {
     }
 
     private List<OpResult> validatePath(Iterable<Op> ops) {
-        List<OpResult> results = new ArrayList<OpResult>();
+        List<OpResult> results = new ArrayList<>();
         boolean error = false;
         for (Op op : ops) {
             try {
@@ -1694,7 +1694,7 @@ public class ZooKeeper implements AutoCloseable {
 
     private MultiOperationRecord generateMultiTransaction(Iterable<Op> ops) {
         // reconstructing transaction with the chroot prefix
-        List<Op> transaction = new ArrayList<Op>();
+        List<Op> transaction = new ArrayList<>();
         for (Op op : ops) {
             transaction.add(withRootPrefix(op));
         }
@@ -3028,9 +3028,12 @@ public class ZooKeeper implements AutoCloseable {
 
     private ClientCnxnSocket getClientCnxnSocket() throws IOException {
         String clientCnxnSocketName = getClientConfig().getProperty(ZKClientConfig.ZOOKEEPER_CLIENT_CNXN_SOCKET);
-        if (clientCnxnSocketName == null) {
+        if (clientCnxnSocketName == null || clientCnxnSocketName.equals(ClientCnxnSocketNIO.class.getSimpleName())) {
             clientCnxnSocketName = ClientCnxnSocketNIO.class.getName();
+        } else if (clientCnxnSocketName.equals(ClientCnxnSocketNetty.class.getSimpleName())) {
+            clientCnxnSocketName = ClientCnxnSocketNetty.class.getName();
         }
+
         try {
             Constructor<?> clientCxnConstructor = Class.forName(clientCnxnSocketName)
                                                        .getDeclaredConstructor(ZKClientConfig.class);
